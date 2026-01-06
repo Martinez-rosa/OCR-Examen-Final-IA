@@ -1,0 +1,4 @@
+Tablas: 0
+Imagenes: 0
+Lineas: 3
+Chars en Linea 1: 9
