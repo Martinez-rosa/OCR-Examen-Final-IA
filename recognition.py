@@ -168,10 +168,7 @@ class TemplateMatcher:
     def recognize_char(self, char_img: np.ndarray, original_wh: Tuple[int, int] = None) -> Tuple[str, float]:
         """
         Compara la imagen del caracter con todas las plantillas.
-        Devuelve (mejor_etiqueta, confianza).
-        Args:
-            char_img: Imagen del caracter (normalizada a 32x32)
-            original_wh: Tupla (width, height) original antes de normalizar, para comparar aspect ratio.
+        Usa variantes morfológicas y suavizado para ser más robusto.
         """
         best_score = -1.0
         best_label = "?"
@@ -180,15 +177,39 @@ class TemplateMatcher:
         if cv2.countNonZero(char_img) == 0:
             return "", 0.0
 
+        # Preprocesar input: Crear variantes para manejar diferencias de grosor y ruido
+        # 1. Normal
+        img_normal = char_img
+        # 2. Suavizada (Blur) - ayuda con pequeñas desalineaciones
+        img_blur = cv2.GaussianBlur(char_img, (3, 3), 0)
+        # 3. Dilatada (más gruesa) - si el input es muy fino
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        img_dilated = cv2.dilate(char_img, kernel, iterations=1)
+        # 4. Erosionada (más fina) - si el input es muy grueso
+        img_eroded = cv2.erode(char_img, kernel, iterations=1)
+        
+        variants = [img_normal, img_blur, img_dilated, img_eroded]
+
         # Iterar sobre todas las clases
         for label, templates_list in self.templates.items():
             for idx, templ in enumerate(templates_list):
-                # Coincidencia de plantillas
-                # Usamos correlación normalizada
-                res = cv2.matchTemplate(char_img, templ, cv2.TM_CCOEFF_NORMED)
-                score = res[0][0]
                 
-                # Penalización por aspect ratio
+                # Suavizar también el template ligeramente
+                templ_blur = cv2.GaussianBlur(templ, (3, 3), 0)
+                
+                # Probar contra todas las variantes del input y quedarse con la mejor
+                local_best_score = -1.0
+                
+                for variant in variants:
+                    # Usamos correlación normalizada
+                    res = cv2.matchTemplate(variant, templ_blur, cv2.TM_CCOEFF_NORMED)
+                    score = res[0][0]
+                    if score > local_best_score:
+                        local_best_score = score
+                
+                score = local_best_score
+                
+                # Penalización por aspect ratio (suavizada para manuscrito)
                 if original_wh and original_wh[1] > 0:
                     input_ratio = original_wh[0] / original_wh[1]
                     
@@ -196,12 +217,11 @@ class TemplateMatcher:
                         tmpl_ratio = self.template_ratios[label][idx]
                         diff = abs(input_ratio - tmpl_ratio)
                         
-                        # Penalización adaptativa
-                        # Si la diferencia es muy grande (ej. 1.0 vs 0.3), penalizar fuerte
-                        if diff > 0.4:
-                            score -= diff * 0.5
-                        elif diff > 0.15:
-                            score -= diff * 0.25
+                        # Penalización adaptativa (menos severa para manuscrito)
+                        if diff > 0.6: # Antes 0.4
+                            score -= diff * 0.4
+                        elif diff > 0.3: # Antes 0.15
+                            score -= diff * 0.15
                 
                 if score > best_score:
                     best_score = score
@@ -209,17 +229,13 @@ class TemplateMatcher:
         
         # === LÓGICA DE DECISIÓN AVANZADA ===
         
-        # 1. Penalización para símbolos si la confianza es baja
-        # Los símbolos (puntos, guiones) suelen dar falsos positivos con ruido
-        if best_label in [".", "-", "_", "@"]:
-            if best_score < 0.75: # Exigimos mucha confianza para un símbolo
-                # Intentar buscar la segunda mejor opción que sea ALFANUMÉRICA
-                # (Simplificación: por ahora solo bajamos la confianza o descartamos)
-                # O mejor: si es símbolo y score bajo, retornamos vacío o ?
+        # 1. Penalización para símbolos
+        if best_label in [".", "-", "_", "@", ",", ":", ";"]:
+            if best_score < 0.6: # Antes 0.75
                 pass 
         
-        # 2. Umbral mínimo global
-        if best_score < 0.45:
+        # 2. Umbral mínimo global (reducido para manuscrito)
+        if best_score < 0.35: # Antes 0.45
             return "?", best_score
             
         return best_label, best_score
@@ -382,6 +398,10 @@ class CNNRecognizer:
             # Ignorar contenedores
             if label_name in ignored_containers:
                 continue
+
+            # Ignorar etiquetas no deseadas (slash, etc.)
+            if label_name in ignored_labels:
+                continue
                 
             # Verificar si tiene imágenes
             has_images = any(f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')) for f in files)
@@ -478,9 +498,50 @@ class CNNRecognizer:
         X, y, labels = self._enumerate_templates()
         if X.shape[0] == 0:
             return
+        print(f"Entrenando con {X.shape[0]} muestras y {len(labels)} clases.")
         self.classes = labels
+        
+        # Mezclar datos (Shuffle) antes de entrenar para que la validación sea representativa
+        indices = np.arange(X.shape[0])
+        np.random.shuffle(indices)
+        X = X[indices]
+        y = y[indices]
+        
         self.model = self._build_model(num_classes=len(labels))
-        self.model.fit(X, y, epochs=epochs, batch_size=32, verbose=1, validation_split=0.1)
+        
+        # --- DATA AUGMENTATION ---
+        # Crucial para manuscrito donde la orientación, zoom y forma varían mucho
+        try:
+            from tensorflow.keras.preprocessing.image import ImageDataGenerator
+            datagen = ImageDataGenerator(
+                rotation_range=15,      # Rotación +/- 15 grados
+                width_shift_range=0.15, # Desplazamiento horizontal
+                height_shift_range=0.15,# Desplazamiento vertical
+                shear_range=0.15,       # Inclinación (cursiva)
+                zoom_range=0.15,        # Zoom
+                fill_mode='constant',
+                cval=0                  # Rellenar con negro
+            )
+            # Entrenar con generador
+            # Dividimos X, y en train/val manualmente para usar fit con generator
+            split_idx = int(len(X) * 0.9)
+            X_train, X_val = X[:split_idx], X[split_idx:]
+            y_train, y_val = y[:split_idx], y[split_idx:]
+            
+            # Ajustamos batch_size y steps_per_epoch
+            batch_size = 32
+            
+            print("Iniciando entrenamiento con Data Augmentation...")
+            self.model.fit(
+                datagen.flow(X_train, y_train, batch_size=batch_size),
+                validation_data=(X_val, y_val),
+                epochs=epochs,
+                steps_per_epoch=len(X_train) // batch_size if len(X_train) >= batch_size else 1,
+                verbose=1
+            )
+        except Exception as e:
+            print(f"Advertencia: No se pudo usar Data Augmentation ({e}). Usando fit normal.")
+            self.model.fit(X, y, epochs=epochs, batch_size=32, verbose=1, validation_split=0.1)
         
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         self.model.save(self.model_path)
@@ -517,6 +578,11 @@ class CNNRecognizer:
         avg_width = np.mean(widths) if widths else 10
         space_threshold = avg_width * 0.4
         text = ""
+        
+        # Filtro estricto de símbolos
+        # Permitimos solo alfanuméricos y espacios, y quizas puntos/comas básicos si tienen alta confianza
+        ignored_symbols = ["@", "_", "-", "+", "(", ")", "[", "]", "{", "}", "<", ">", "|", "\\", "/", "*", "=", "#", "$", "%", "^", "&"]
+
         for i, c in enumerate(chars_data):
             if i > 0:
                 prev = chars_data[i-1]
@@ -524,6 +590,16 @@ class CNNRecognizer:
                 if gap > space_threshold:
                     text += " "
             label, score = self.predict_char(c['img'])
+            
+            # FILTRADO DE SIMBOLOS
+            if label in ignored_symbols:
+                continue # Ignorar símbolo
+            
+            # Si no es alfanumérico (ej. es un punto, coma, etc.) requerir confianza muy alta
+            if not label.isalnum():
+                 if score < 0.95: # Muy estricto para símbolos
+                     continue
+
             if label != "?":
                 text += label
         return text

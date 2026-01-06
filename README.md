@@ -35,7 +35,10 @@ El proyecto se estructura en módulos modulares que separan la lógica de interf
 
 3.  **`ocr_system.py` (Orquestador)**
     - Controlador principal que integra la segmentación y el reconocimiento.
-    - Decide qué modelo (CNN) utilizar basándose en el parámetro `text_type`.
+    - **Gestión de Estrategias**: Utiliza **CNN** para texto digital (alta velocidad y precisión) y **Template Matching Avanzado** para texto manuscrito (mayor robustez con trazos irregulares).
+    - **Gestión de Salida**: Crea automáticamente carpetas con fecha y hora en `output/` para guardar:
+        - `result.txt`: El texto extraído.
+        - `image_X.png`: Imágenes detectadas (no texto) extraídas del documento original.
     - Procesa la imagen completa: segmenta página -> líneas -> caracteres -> reconoce -> ensambla texto.
 
 4.  **`segmentation.py` (Visión Artificial)**

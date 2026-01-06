@@ -22,12 +22,17 @@ class OCRSystem:
             
         self.segmenter = DocumentSegmenter(debug=debug)
         self.matcher = TemplateMatcher(templates_dir)
+        # Inicializar matcher específico para manuscrito
+        self.matcher_manuscrito = TemplateMatcher(os.path.join(templates_dir, "manuscrito"))
         
         # Inicializar modelos especializados
         self.cnn_digital = CNNRecognizer(templates_dir=os.path.join(templates_dir, "digital"), model_path="models/model_digital.h5")
         self.cnn_manuscrito = CNNRecognizer(templates_dir=os.path.join(templates_dir, "manuscrito"), model_path="models/model_manuscrito.h5")
         
     def process_image(self, image_input: Any, text_type: str = "digital") -> Dict[str, Any]:
+        import time
+        import datetime
+        
         img = None
         if isinstance(image_input, str):
             img = self._load_image(image_input)
@@ -39,10 +44,15 @@ class OCRSystem:
             raise ValueError("Input debe ser ruta (str) o imagen (numpy array)")
             
         # Seleccionar modelo
+        active_recognizer = None
+        
         if text_type == "manuscrito":
-            active_cnn = self.cnn_manuscrito
+            # El usuario solicitó explícitamente usar MATCHING con templates de manuscrito
+            print("[INFO] Usando Template Matching para manuscrito (solicitud de usuario)")
+            active_recognizer = self.matcher_manuscrito
         else:
-            active_cnn = self.cnn_digital
+            # Para digital preferimos CNN
+            active_recognizer = self.cnn_digital
 
         regions = self.segmenter.segment_page(img)
 
@@ -50,38 +60,42 @@ class OCRSystem:
         text_lines_content: List[str] = []
         for line_img in regions['text_lines']:
             chars_data = self.segmenter.segment_characters(line_img)
-            # Usar CNN si está disponible, sino Matcher
-            if getattr(active_cnn, "model", None) is not None:
-                line_text = active_cnn.recognize_line(chars_data)
-            else:
-                line_text = self.matcher.recognize_line(chars_data)
-            full_text += line_text + "\n"
-            text_lines_content.append(line_text)
+            
+            line_text = active_recognizer.recognize_line(chars_data)
+            
+            if line_text.strip(): # Solo añadir si no es vacío
+                full_text += line_text + "\n"
+                text_lines_content.append(line_text)
 
         processed_tables: List[List[List[str]]] = []
-        if regions["tables"] and regions.get("binary_image") is not None:
-            binary_full = regions.get("binary_image")
-            for tbl_rect in regions.get("tables_rects", []):
-                x, y, w, h = tbl_rect
-                tbl_bin = binary_full[y:y+h, x:x+w]
-                try:
-                    rows_cells = self.segmenter.extract_table_structure(tbl_bin)
-                    table_data: List[List[str]] = []
-                    for row in rows_cells:
-                        row_data: List[str] = []
-                        for cell_img in row:
-                            chars = self.segmenter.segment_characters(cell_img)
-                            if getattr(active_cnn, "model", None) is not None:
-                                cell_text = active_cnn.recognize_line(chars)
-                            else:
-                                cell_text = self.matcher.recognize_line(chars)
-                            row_data.append(cell_text)
-                        table_data.append(row_data)
-                    processed_tables.append(table_data)
-                except Exception as e:
-                    if self.debug:
-                        print(f"Error procesando tabla: {e}")
-                    processed_tables.append([])
+        # TABLAS DESACTIVADAS POR SOLICITUD DEL USUARIO
+        
+        # === GUARDAR RESULTADOS EN DISCO ===
+        # Crear carpeta outputs si no existe
+        output_base = "output"
+        if not os.path.exists(output_base):
+            os.makedirs(output_base)
+            
+        # Carpeta timestamp para esta ejecución
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(output_base, f"run_{timestamp}")
+        os.makedirs(run_dir)
+        
+        # 1. Guardar Texto
+        txt_path = os.path.join(run_dir, "result.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(full_text)
+            
+        # 2. Guardar Imágenes extraídas (si las hay)
+        extracted_images_paths = []
+        for i, img_roi in enumerate(regions.get("images", [])):
+            if img_roi is not None and img_roi.size > 0:
+                img_name = f"image_{i}.png"
+                img_path = os.path.join(run_dir, img_name)
+                cv2.imwrite(img_path, img_roi)
+                extracted_images_paths.append(img_path)
+
+        print(f"[INFO] Resultados guardados en: {run_dir}")
 
         return {
             "text": full_text,
@@ -89,7 +103,8 @@ class OCRSystem:
             "tables_data": processed_tables,
             "tables_imgs": regions["tables"],
             "images": regions["images"],
-            "codes": regions.get("codes", [])
+            "codes": regions.get("codes", []),
+            "output_dir": run_dir
         }
 
     def _load_image(self, path: str) -> Optional[np.ndarray]:
